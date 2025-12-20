@@ -1,5 +1,4 @@
 import os
-import requests
 import smtplib
 from email.mime.text import MIMEText
 from fastapi import FastAPI
@@ -7,27 +6,30 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
 from dotenv import load_dotenv
+from huggingface_hub import InferenceClient
 
 # 1. Load Environment Variables
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-HF_TOKEN = os.getenv("HF_TOKEN")  # <--- Make sure this is in your Render Env Vars
+HF_TOKEN = os.getenv("HF_TOKEN")
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
-# 2. Initialize GEMINI CLIENT (For Chat)
-client = None
+# 2. Initialize Clients
+# Gemini (For Chat)
+gemini_client = None
 if GEMINI_API_KEY:
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         print("✅ Gemini Client Initialized")
     except Exception as e:
         print(f"❌ Gemini Client Failed: {e}")
 
-# 3. Config for Hugging Face (For Emotion Detection)
-HF_API_URL = "https://api-inference.huggingface.co/models/facebook/bart-large-mnli"
-hf_headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+# Hugging Face (For Emotion) - Connects to Cloud API
+if not HF_TOKEN:
+    print("⚠️ WARNING: HF_TOKEN is missing. Emotion detection will fail.")
+hf_client = InferenceClient(token=HF_TOKEN)
 
 app = FastAPI()
 
@@ -69,36 +71,47 @@ def send_emergency_email(user_email, target_email, user_text):
 
 @app.post("/predict")
 def predict_emotion(data: AnalysisRequest):
-    # The categories to check against
-    labels = ["Calm", "Anxious", "Overwhelmed", "Low", "Focused", "Energized", "Sad"]
-    
-    payload = {
-        "inputs": data.text,
-        "parameters": {"candidate_labels": labels}
-    }
-
     try:
-        # Hit Hugging Face Cloud API
-        response = requests.post(HF_API_URL, headers=hf_headers, json=payload)
-        result = response.json()
+        # Use sentiment analysis (simple, reliable, FREE on Hugging Face)
+        result = hf_client.text_classification(
+            text=data.text,
+            model="cardiffnlp/twitter-roberta-base-sentiment-latest"
+        )
         
-        # Check if model is loading (HF specific 503 error)
-        if "error" in result and "loading" in result["error"]:
-            print("⚠️ Model loading, falling back to Anxious")
-            return {"emotion": "Anxious"} 
-
-        # result is usually dict with 'labels' and 'scores'
-        top_emotion = result['labels'][0]
-        return {"emotion": top_emotion}
+        print(f"📦 Sentiment Result: {result}")
+        
+        # Map sentiment to your 7 emotions
+        if result and len(result) > 0:
+            label = result[0]['label'].lower()
+            score = result[0]['score']
+            
+            # Smart mapping based on sentiment + confidence
+            if 'positive' in label:
+                emotion = 'Energized' if score > 0.75 else 'Calm'
+            elif 'negative' in label:
+                if score > 0.8:
+                    emotion = 'Overwhelmed'
+                elif score > 0.6:
+                    emotion = 'Anxious'
+                else:
+                    emotion = 'Low'
+            else:  # neutral
+                emotion = 'Focused'
+            
+            print(f"✅ Detected emotion: {emotion}")
+            return {"emotion": emotion}
+        
+        return {"emotion": "Calm"}
         
     except Exception as e:
-        print(f"⚠️ HF API Error: {e}")
-        # Fallback to Anxious so app doesn't crash
-        return {"emotion": "Anxious"}
+        print(f"⚠️ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"emotion": "Calm"}
 
 @app.post("/chat")
 def chat_with_therapist(data: ChatRequest):
-    if not client:
+    if not gemini_client:
         return {"reply": "I am listening. Please tell me more.", "action": None}
 
     prompt = f"""
@@ -111,7 +124,7 @@ def chat_with_therapist(data: ChatRequest):
     """
 
     try:
-        response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+        response = gemini_client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
         reply = response.text.strip()
         
         action_taken = None
@@ -123,9 +136,10 @@ def chat_with_therapist(data: ChatRequest):
         
         return {"reply": reply, "action": action_taken}
     except Exception as e:
+        print(f"Chat Error: {e}")
         return {"reply": "I hear you. I'm right here with you.", "action": None}
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # Use port 8000 for local development
+    uvicorn.run(app, host="0.0.0.0", port=8000)
